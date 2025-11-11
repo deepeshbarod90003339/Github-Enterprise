@@ -1,0 +1,21 @@
+#Okta Keys are stored here
+OKTA_DOMAIN = "https://takeda.okta.com"
+OKTA_AUDIENCE = "api://oneData"
+OKTA_ISSUER = f"{OKTA_DOMAIN}/oauth2/aus1lwtnqivqwTagO358"
+OKTA_JWKS_URL = f"{OKTA_ISSUER}/v1/keys"
+
+CONFIG_FILE_PATH = "../config/dev/config.json"
+URL_KEY = "URL_KEY"
+NAMESPACE_KEY = "NAMESPACE_KEY"
+ROLE_ID_KEY= "ROLE_ID_KEY"
+SECRET_ID_KEY ="SECRET_ID_KEY"
+VAULT_SECRET_ENGINE = "VAULT_SECRET_ENGINE"
+DATA_KEY = "data"
+AUTH_KEY = "auth"
+CLIENT_TOKEN_KEY = "client_token"
+ENVIRONMENT_KEY = "environment"
+
+HARNESS_BASE_URL = "https://app.harness.io/gateway/pipeline/api/pipeline/execute/PIPELINE_ID?accountIdentifier=etUzqvIyRSixpOWJqF4_Qg&orgIdentifier=GDDT&projectIdentifier=EDA"
+PIPELINE_ID_KEY = "PIPELINE_ID"
+HARNESS_KEY_PATH = "ODPE/harness"
+CA_PIPELINE_ID = "cross_account_pipeline_id"

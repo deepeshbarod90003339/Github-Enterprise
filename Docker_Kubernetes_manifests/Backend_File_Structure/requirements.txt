@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pydantic
+requests
+PyJWT~=2.4.0
+cryptography
+pyyaml
+aiohttp
+asyncio

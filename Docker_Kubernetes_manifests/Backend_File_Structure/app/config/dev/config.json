@@ -1,0 +1,14 @@
+{
+    "environment": "dev",
+    "URL_KEY": "https://vault-usvga-prd-primary-private-vault-aba33721.858bf6b9.z1.hashicorp.cloud:8200/",
+    "NAMESPACE_KEY": "admin/ODPE",
+    "ROLE_ID_KEY": "78933220-b26e-6282-e8e4-8fea29908c6f",
+    "SECRET_ID_KEY": "838e349b-9e74-c46a-cff6-87c349319d0c",
+    "VAULT_SECRET_ENGINE" : {
+        "dev" : "kv-dev",
+        "prd" : "kv-prd",
+        "tst" : "kv-tst"
+    },
+    "cross_account_pipeline_id": "TestDJDSaaSCrossAccountDataSharing_Clone"
+    
+}
