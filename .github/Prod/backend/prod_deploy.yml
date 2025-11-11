@@ -1,0 +1,217 @@
+name: DSaaS Backend Prod-Deploy CI/CD Workflow
+
+on:
+  push:
+    branches:
+      - main-v1
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: [self-hosted, Linux, eda-api-dataplatform-dsaas, Backend, Prod, X64]
+
+    env:
+      AWS_REGION: us-east-1
+      AWS_ACCOUNT_ID: 432372222409
+      ECR_REPO: eda/services/dataplatform/dsaas
+      IMAGE_TAG: latest
+      CLUSTER_NAME: USVGAEDPLPP001
+      NAMESPACE: eda-services
+      DEPLOYMENT_NAME: eda-services-dataplatform-dsaas-deploy
+      SERVICE_NAME: eda-services-dataplatform-dsaas-svc
+
+
+    steps:
+      - name: Setup Docker permissions
+        run: |
+          sudo usermod -aG docker $USER
+          sudo systemctl restart docker
+          # Check if user is in docker group
+          groups $USER | grep docker || echo "User not in docker group yet"
+
+      - name: Cleanup Disk on EC2 Runner
+        run: |
+          echo "Cleaning Docker resources..."
+          sg docker -c "docker system prune -a -f --volumes" || echo "Docker cleanup failed, continuing..."
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install QA tools with system Python
+        continue-on-error: true
+        run: |
+          echo "Using system Python for QA tools..."
+          python3 --version
+          python3 -m pip install --user --upgrade pip
+          python3 -m pip install --user yamllint flake8 black isort pytest
+          
+          # Add user bin to PATH
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Validate Python syntax
+        continue-on-error: true
+        run: |
+          echo "Checking Python syntax..."
+          find . -type f -name "*.py" ! -path "./venv/*" -exec bash -c '
+            for file; do
+              python3 -m py_compile "$file" || echo "::error file=$file::Syntax error"
+            done
+          ' bash {} +
+
+      - name: Validate YAML syntax
+        continue-on-error: true
+        run: |
+          echo "Running yamllint..."
+          export PATH="$HOME/.local/bin:$PATH"
+          if [ -d "deploy" ]; then
+            yamllint -d relaxed deploy/ || echo "YAML validation failed, continuing..."
+          else
+            echo "No deploy directory found, skipping YAML validation"
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: arn:aws:iam::263789222982:role/Contracts-dashboard-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Setup kubectl config from EKS EC2
+        run: |
+          echo "Setting up kubectl configuration..."
+          
+          # Create .kube directory if it doesn't exist
+          mkdir -p ~/.kube
+          
+          # Try to update kubeconfig using AWS CLI
+          aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME --kubeconfig ~/.kube/config
+          
+          # Set proper permissions
+          chmod 600 ~/.kube/config
+          
+          # Verify the config
+          echo "Kubeconfig setup completed. Testing connection..."
+          kubectl config current-context || echo "No current context set"
+          kubectl config get-contexts || echo "No contexts available"
+
+      - name: Network and EKS Diagnostics
+        continue-on-error: true
+        run: |
+          echo "=== Network and EKS Connectivity Diagnostics ==="
+          
+          echo "1. Current AWS identity:"
+          aws sts get-caller-identity
+          
+          echo "2. Getting EKS cluster endpoint:"
+          EKS_ENDPOINT=$(aws eks describe-cluster --name $CLUSTER_NAME --region $AWS_REGION --query 'cluster.endpoint' --output text 2>/dev/null || echo "Failed to get endpoint")
+          echo "EKS Endpoint: $EKS_ENDPOINT"
+          
+          echo "3. Testing DNS resolution:"
+          nslookup $(echo $EKS_ENDPOINT | sed 's|https://||') || echo "DNS resolution failed"
+          
+          echo "4. Testing network connectivity to EKS API:"
+          EKS_HOST=$(echo $EKS_ENDPOINT | sed 's|https://||')
+          nc -zv $EKS_HOST 443 || echo "Cannot reach EKS API on port 443"
+          
+          echo "5. Checking security groups and network:"
+          curl -s --connect-timeout 10 $EKS_ENDPOINT/version || echo "HTTPS connection to EKS failed"
+          
+          echo "6. Testing kubectl with verbose output:"
+          kubectl cluster-info --v=6 || echo "Kubectl cluster-info failed"
+          
+          echo "7. Checking kubeconfig content:"
+          cat ~/.kube/config | grep -E '(server|certificate-authority-data)' || echo "No kubeconfig found"
+          
+          echo "8. IAM permissions check:"
+          aws eks describe-cluster --name $CLUSTER_NAME --region $AWS_REGION || echo "No EKS describe permissions"
+
+      - name: System resource check
+        run: |
+          echo "System resource snapshot:"
+          df -h
+          free -m
+          sg docker -c "docker stats --no-stream" || true
+
+      - name: Copy environment-specific config
+        run: |
+          CURRENT_ENV="dev"
+          CONFIG_PATH="configs/$CURRENT_ENV/config.json"
+          
+          if [ ! -f "$CONFIG_PATH" ]; then
+            echo "❌ Error: Config file not found at $CONFIG_PATH"
+            exit 1
+          fi
+          
+          echo "📁 Copying config: $CONFIG_PATH → configs/"
+          echo "📁 from config/$CURRENT_ENV folder"
+          cp "$CONFIG_PATH" configs/config.json
+          ls -l configs/config.json
+          echo "✅ Config file copied successfully"
+
+      - name: Docker Build and Push (with proper permissions)
+        run: |
+          ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG}"
+          
+          echo "🔍 Checking if Docker image exists locally: $ECR_URI"
+          if sg docker -c "docker images --format '{{.Repository}}:{{.Tag}}'" | grep -q "$ECR_URI"; then
+            echo "🗑️ Docker image found. Deleting local image..."
+            sg docker -c "docker rmi $ECR_URI" || true
+            sleep 5
+          else
+            echo "✅ No existing local Docker image found."
+          fi
+          
+          echo "🔨 Building Docker image..."
+          sg docker -c "docker build --no-cache -t $ECR_URI ."
+          sleep 5
+          
+          echo "🔐 Logging in to Amazon ECR..."
+          aws ecr get-login-password --region $AWS_REGION | sg docker -c "docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+          
+          echo "📦 Pushing Docker image to ECR..."
+          sg docker -c "docker push $ECR_URI"
+          echo "✅ Docker image pushed: $ECR_URI"
+
+      - name: Deploy to EKS (matching BuildAndDeploy.sh)
+        run: |
+          echo "🔎 Checking existing resources in namespace: $NAMESPACE"
+          if kubectl get all -n $NAMESPACE | grep -q "$DEPLOYMENT_NAME"; then
+            echo "🗑️ Existing deployment found. Deleting..."
+            kubectl delete deployment $DEPLOYMENT_NAME -n $NAMESPACE
+          fi
+          
+          if kubectl get service -n $NAMESPACE | grep -q "$SERVICE_NAME"; then
+            echo "🗑️ Existing service found. Deleting..."
+            kubectl delete service $SERVICE_NAME -n $NAMESPACE
+          fi
+          
+          DEPLOY_FOLDER="deploy/dev"
+          if [ -d "$DEPLOY_FOLDER" ]; then
+            echo "📂 Navigating to deployment folder: $DEPLOY_FOLDER"
+            cd $DEPLOY_FOLDER
+          else
+            echo "❌ Error: Deployment folder $DEPLOY_FOLDER does not exist!"
+            exit 1
+          fi
+          
+          echo "📄 Applying deployment file..."
+          kubectl apply -f deploy.yml -n $NAMESPACE
+          
+          echo "📄 Applying service file..."
+          kubectl apply -f service.yml -n $NAMESPACE
+          
+          echo "📄 Applying ingress file..."
+          kubectl apply -f ingress.yml -n $NAMESPACE
+          
+          echo "✅ Deployment and service applied successfully!"
+          
+          echo "📈 Current status in namespace: $NAMESPACE"
+          kubectl get all -n $NAMESPACE
+          
+          echo "🎉 Dsaas Backend deployment completed!"

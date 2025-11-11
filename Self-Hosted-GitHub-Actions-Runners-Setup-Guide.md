@@ -253,8 +253,10 @@ sudo nano /home/ubuntu/manage-runners.sh
 
 RUNNERS_BASE="/home/ubuntu"
 RUNNERS=(
-    "actions-runner-AI-labs-backend"     # AI-labs Backend Runner
-    "actions-runner-AI-labs-frontend"    # AI-labs Frontend Runner
+    "actions-runner-AI-labs-backend"           # AI-labs Backend Runner
+    "actions-runner-AI-labs-frontend"          # AI-labs Frontend Runner
+    "actions-runner-DataPlatform-LaunchPad-BE" # DataPlatform LaunchPad Backend Runner
+    "actions-runner-DataPlatform-LaunchPad-FE" # DataPlatform LaunchPad Frontend Runner
     # Add more runners as needed for additional repositories
 )
 

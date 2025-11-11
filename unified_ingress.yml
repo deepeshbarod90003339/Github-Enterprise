@@ -1,0 +1,188 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: eda-unified-ingress
+  namespace: eda-ui
+  annotations:
+    alb.ingress.kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/subnets: subnet-0e9621e7e21a68d17,subnet-03fefe8d468ba890a,subnet-0358a1fd3812cd25c
+    alb.ingress.kubernetes.io/group.name: dq2-alb
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/tags: apms-id=APMS-10612
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-1:263789222982:certificate/e179f23c-68b5-4c73-ac45-0b2899a2f044
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: eda-unified-service
+                port:
+                  name: svcui-sslport
+          - path: /eda/ui/dq
+            pathType: Prefix
+            backend:
+              service:
+                name: eda-ui-dq-service
+                port:
+                  name: svcui-sslport
+          - path: /eda/ui/dataplatform
+            pathType: Prefix
+            backend:
+              service:
+                name: eda-ui-infra-service
+                port:
+                  name: svcui-sslport
+          - path: /eda/ui/cdp
+            pathType: Prefix
+            backend:
+              service:
+                name: eda-ui-cdp-service
+                port:
+                  name: svcui-sslport
+          - path: /eda/ui/chatbot
+            pathType: Prefix
+            backend:
+              service:
+                name: eda-ui-chatbot-service
+                port:
+                  name: svcui-sslport
+          - path: /eda/ui/chatbot/v2
+            pathType: Prefix
+            backend:
+              service:
+                name: eda-ui-chatbot-v2-service
+                port:
+                  name: svcui-sslport
+          - path: /eda/ui/contracts-analytics
+            pathType: Prefix
+            backend:
+              service:
+                name: eda-ui-cd-service
+                port:
+                  name: svcui-sslport
+          - path: /eda/ui/chatbot-assetwizard
+            pathType: Prefix
+            backend:
+              service:
+                name: eda-ui-chatbot-assetwizard-service
+                port:
+                  name: svcui-sslport
+          - path: /eda/maiaccess/ui/dpt
+            pathType: Prefix
+            backend:
+              service:
+                name: maiaccess-ui-dpt-service
+                port:
+                  name: svcui-sslport
+          - path: /eda/ui/dm-agent
+            pathType: Prefix
+            backend:
+              service:
+                name: eda-ui-dm-service
+                port:
+                  name: svcui-sslport
+          - path: /eda/mai/ui/oss
+            pathType: Prefix
+            backend:
+              service:
+                name: mai-ui-oss-service
+                port:
+                  name: svcui-sslport
+          - path: /eda/ui/dataplatform/datascience    # AI Lab Frontend in Data Platform
+            pathType: Prefix
+            backend:
+              service:
+                name: eda-ui-dataplatform-datascience-svc
+                port:
+                  name: svcui-sslport
+          - path: /eda/ui/bmc-framework
+            pathType: Prefix
+            backend:
+              service:
+                name: eda-ui-bmc-service
+                port:
+                  name: svcui-sslport
+          - path: /eda/ui/analyst-agent
+            pathType: Prefix
+            backend:
+              service:
+                name: eda-ui-analystagent-svc
+                port:
+                  name: svcui-sslport
+          - path: /eda/ui/odp
+            pathType: Prefix
+            backend:
+              service:
+                name: odp-ui-service
+                port:
+                  name: svcui-sslport
+          - path: /eda/ui/gvd-agent
+            pathType: Prefix
+            backend:
+              service:
+                name: eda-ui-gvdagent-svc
+                port:
+                  name: svcui-sslport
+          - path: /eda/ui/brms
+            pathType: Prefix
+            backend:
+              service:
+                name: eda-ui-brms-svc
+                port:
+                  name: svcui-sslport
+          - path: /eda/ui/dq-pre-dev
+            pathType: Prefix
+            backend:
+              service:
+                name: eda-ui-dq-predev-service
+                port:
+                  name: svcui-sslport
+          - path: /eda/ui/dataplatform/dsaas
+            pathType: Prefix
+            backend:
+              service:
+                name: eda-ui-dataplatform-dsaas-svc
+                port:
+                  name: svcui-sslport
+          - path: /odp/ui/communities
+            pathType: Prefix
+            backend:
+              service:
+                name: odp-ui-communities-svc
+                port:
+                  name: svcui-sslport
+          - path: /odp
+            pathType: Prefix
+            backend:
+              service:
+                name: odp-ui-service-dev
+                port:
+                  name: svcui-sslport
+          - path: /odp/ui/fluency
+            pathType: Prefix
+            backend:
+              service:
+                name: odp-ui-fluency-service
+                port:
+                  name: svcui-sslport
+          - path: /eda/ui/knowledge-assistant
+            pathType: Prefix
+            backend:
+              service:
+                name: eda-ui-knowledge-assistant-svc
+                port:
+                  name: svcui-sslport
+          - path: /eda/ui/data-lens
+            pathType: Prefix
+            backend:
+              service:
+                name: eda-ui-data-lens-svc
+                port:
+                  name: svcui-sslport

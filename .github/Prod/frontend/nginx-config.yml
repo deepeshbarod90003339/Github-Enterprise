@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-config
+  namespace: eda-ui
+data:
+  default.conf: |
+    server {
+        listen 80;
+        server_name _;
+
+        # Serve static assets correctly
+        location /eda/ui/dataplatform/dsaas/assets/ {
+            alias /usr/share/nginx/html/eda/ui/dataplatform/dsaas/assets/;
+            expires 1y;
+            access_log off;
+            add_header Cache-Control "public, max-age=31536000, immutable";
+        }
+
+        # Handle DSaaS application routes
+        location /eda/ui/dataplatform/dsaas {
+            alias /usr/share/nginx/html/eda/ui/dataplatform/dsaas;
+            try_files $uri $uri/ /eda/ui/dataplatform/dsaas/index.html;
+            index index.html;
+        }
+        
+        # Health check endpoint
+        location /health {
+            return 200 'OK';
+            add_header Content-Type text/plain;
+        }
+
+        # Default fallback
+        location / {
+            return 404;
+        }
+    }

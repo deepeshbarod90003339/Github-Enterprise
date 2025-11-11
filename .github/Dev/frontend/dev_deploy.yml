@@ -1,0 +1,163 @@
+name: DSaaS Frontend Dev-Deploy CI/CD Workflow
+
+on:
+  push:
+    branches:
+      - dev-v1
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: [self-hosted, Linux, eda-ui-dataplatform-dsaas, Frontend, Dev, X64]
+
+    env:
+      AWS_REGION: us-east-1
+      AWS_ACCOUNT_ID: 263789222982
+      ECR_REPO: eda/ui/dataplatform/dsaas
+      IMAGE_TAG: latest
+      CLUSTER_NAME: USVGAEDPLPD1
+      NAMESPACE: eda-ui
+      DEPLOYMENT_NAME: eda-ui-dataplatform-dsaas-deploy
+      SERVICE_NAME: eda-ui-dataplatform-dsaas-svc
+
+
+    steps:
+      - name: Setup Docker permissions
+        run: |
+          sudo usermod -aG docker $USER
+          sudo systemctl restart docker
+          groups $USER | grep docker || echo "User not in docker group yet"
+
+      - name: Cleanup Disk on EC2 Runner
+        run: |
+          echo "Cleaning Docker resources..."
+          sg docker -c "docker system prune -a -f --volumes" || echo "Docker cleanup failed, continuing..."
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm install set-cookie-parser --save-dev || echo "set-cookie-parser install failed, continuing..."
+
+      - name: Run ESLint
+        continue-on-error: true
+        run: |
+          npx eslint . --ext .ts,.tsx,.js,.jsx || echo "ESLint failed, continuing..."
+
+      - name: Run Prettier check
+        continue-on-error: true
+        run: |
+          npx prettier --check . || echo "Prettier check failed, continuing..."
+
+      - name: Build application
+        run: |
+          npm run build || echo "Build failed, but continuing with Docker build..."
+
+      - name: Validate YAML syntax
+        continue-on-error: true
+        run: |
+          echo "Running yamllint on Kubernetes manifests..."
+          if [ -d "deploy/dev" ]; then
+            sudo apt-get update && sudo apt-get install -y yamllint
+            yamllint -d relaxed deploy/dev/ || echo "YAML validation failed, continuing..."
+          else
+            echo "No deploy/dev directory found, skipping YAML validation"
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: arn:aws:iam::263789222982:role/Contracts-dashboard-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Setup kubectl config
+        run: |
+          echo "Setting up kubectl configuration..."
+          mkdir -p ~/.kube
+          aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME --kubeconfig ~/.kube/config
+          chmod 600 ~/.kube/config
+          kubectl config current-context || echo "No current context set"
+
+      - name: Test EKS connectivity
+        continue-on-error: true
+        run: |
+          echo "Testing EKS cluster connectivity..."
+          kubectl cluster-info || echo "Cluster info failed"
+          kubectl get namespaces || echo "Get namespaces failed"
+
+      - name: Docker Build and Push (Frontend)
+        continue-on-error: true
+        run: |
+          ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG}"
+          
+          echo "🔍 Checking if Docker image exists locally: $ECR_URI"
+          if sg docker -c "docker images --format '{{.Repository}}:{{.Tag}}'" | grep -q "$ECR_URI"; then
+            echo "🗑️ Docker image found. Deleting local image..."
+            sg docker -c "docker rmi $ECR_URI" || true
+            sleep 5
+          else
+            echo "✅ No existing local Docker image found."
+          fi
+          
+          echo "🔨 Building Docker image..."
+          sg docker -c "docker build --no-cache -t $ECR_URI ."
+          sleep 5
+          
+          echo "🔐 Logging in to Amazon ECR..."
+          aws ecr get-login-password --region $AWS_REGION | sg docker -c "docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+          
+          echo "📦 Pushing Docker image to ECR..."
+          sg docker -c "docker push $ECR_URI"
+          echo "✅ Docker image pushed: $ECR_URI"
+
+      - name: Deploy to EKS (Frontend)
+        run: |
+          echo "🔎 Checking existing resources in namespace: $NAMESPACE"
+          if kubectl get all -n $NAMESPACE | grep -q "$DEPLOYMENT_NAME"; then
+            echo "🗑️ Existing deployment found. Deleting..."
+            kubectl delete deployment $DEPLOYMENT_NAME -n $NAMESPACE
+          fi
+          
+          if kubectl get service -n $NAMESPACE | grep -q "$SERVICE_NAME"; then
+            echo "🗑️ Existing service found. Deleting..."
+            kubectl delete service $SERVICE_NAME -n $NAMESPACE
+          fi
+          
+          DEPLOY_FOLDER="deploy/dev"
+          if [ -d "$DEPLOY_FOLDER" ]; then
+            echo "📂 Navigating to deployment folder: $DEPLOY_FOLDER"
+            cd $DEPLOY_FOLDER
+          else
+            echo "❌ Error: Deployment folder $DEPLOY_FOLDER does not exist!"
+            exit 1
+          fi
+          
+          echo "📄 Applying Nginx ConfigMap..."
+          kubectl apply -f nginx-config.yml -n $NAMESPACE
+          
+          echo "📄 Applying deployment file..."
+          kubectl apply -f deploy.yml -n $NAMESPACE
+          
+          echo "📄 Applying service file..."
+          kubectl apply -f service.yml -n $NAMESPACE
+          
+          echo "✅ Frontend deployment and service applied successfully!"
+          
+          echo "📈 Current status in namespace: $NAMESPACE"
+          kubectl get all -n $NAMESPACE
+          
+          echo "🎉 AI-Lab Frontend deployment completed!"
+          echo "🌐 Application accessible at: https://1data-dev.onetakeda.com/eda/ui/dataplatform/dsaas"

@@ -1,0 +1,30 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: eda-services-dataplatform-dsaas-ingress
+  namespace: eda-services
+  annotations:
+    alb.ingress.kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/subnets: subnet-03b598978a9a4452c,subnet-0fb25472c25d7548e,subnet-0e25a127051226ccd
+    alb.ingress.kubernetes.io/group.name: awsalb
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/tags: apms-id=APMS-10612
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-1:432372222409:certificate/05f65a58-b102-4db7-8df3-23275b1156ee
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+    alb.ingress.kubernetes.io/healthcheck-port: '8000'
+spec:
+  ingressClassName: alb
+  rules:
+    - host: onedata-api.onetakeda.com
+      http:
+        paths:
+          - path: /services/dataplatform/dsaas
+            pathType: Prefix
+            backend:
+              service:
+                name: eda-services-dataplatform-dsaas-svc
+                port:
+                  name: http
