@@ -1,0 +1,212 @@
+name: Deploy to Test
+
+on:
+  push:
+    branches: [test]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: data-collection/test/data-collection-service
+  ENVIRONMENT: test
+  TF_WORKSPACE: test
+
+jobs:
+  integration-tests:
+    runs-on: [self-hosted, linux, x64, aws, test]
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install test dependencies
+      run: |
+        pip install pytest requests selenium locust
+        pip install -r app/requirements.txt
+    
+    - name: Run integration tests
+      run: |
+        pytest tests/integration/ -v --junitxml=integration-results.xml
+    
+    - name: Performance tests
+      run: |
+        locust -f tests/performance/locustfile.py --headless -u 10 -r 2 -t 60s --host=http://dev-api.datacollection.com
+    
+    - name: Upload integration test results
+      uses: actions/upload-artifact@v3
+      with:
+        name: integration-test-results
+        path: integration-results.xml
+
+  security-compliance:
+    runs-on: [self-hosted, linux, x64, aws, test]
+    needs: integration-tests
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: OWASP ZAP Security Scan
+      run: |
+        docker run -v $(pwd):/zap/wrk/:rw -t owasp/zap2docker-stable zap-baseline.py \
+          -t http://dev-api.datacollection.com -J zap-report.json || true
+    
+    - name: Container Image Security Scan
+      run: |
+        trivy image --format table --severity HIGH,CRITICAL ${{ secrets.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:develop-${{ github.sha }}
+    
+    - name: Infrastructure Security Scan
+      run: |
+        # Scan Terraform files for security issues
+        trivy config terraform/
+    
+    - name: Upload security reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-compliance-reports
+        path: |
+          zap-report.json
+          trivy-*.json
+
+  deploy-test:
+    runs-on: [self-hosted, linux, x64, aws, test]
+    needs: [integration-tests, security-compliance]
+    environment: test
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Configure AWS credentials
+      run: |
+        aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws configure set default.region ${{ env.AWS_REGION }}
+    
+    - name: Configure kubectl
+      run: |
+        aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name data-collection-test-eks
+    
+    - name: Deploy to test environment
+      run: |
+        helm upgrade --install data-collection-service helm/data-collection-service/ \
+          --namespace data-collection-test \
+          --create-namespace \
+          --set image.repository=${{ secrets.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }} \
+          --set image.tag=develop-${{ github.sha }} \
+          --set environment=test \
+          --set resources.requests.cpu=250m \
+          --set resources.requests.memory=256Mi \
+          --set resources.limits.cpu=1000m \
+          --set resources.limits.memory=1Gi \
+          --set autoscaling.minReplicas=2 \
+          --set autoscaling.maxReplicas=5 \
+          --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=${{ secrets.EKS_SERVICE_ACCOUNT_ROLE_ARN_TEST }} \
+          --wait --timeout=15m
+    
+    - name: Verify deployment
+      run: |
+        kubectl wait --for=condition=ready pod -l app=data-collection-service -n data-collection-test --timeout=300s
+        kubectl get pods -n data-collection-test
+        kubectl get svc -n data-collection-test
+    
+    - name: Run end-to-end tests
+      run: |
+        # Get ALB endpoint
+        ALB_ENDPOINT=$(aws elbv2 describe-load-balancers --names data-collection-test-alb --query 'LoadBalancers[0].DNSName' --output text)
+        
+        # API endpoint tests
+        curl -f http://$ALB_ENDPOINT/health
+        
+        # Job creation test
+        JOB_ID=$(curl -X POST http://$ALB_ENDPOINT/api/v1/jobs/trigger \
+          -H "Content-Type: application/json" \
+          -d '{"source_type": "api", "config": {}}' | jq -r '.job_id')
+        
+        # Job status test
+        curl -f http://$ALB_ENDPOINT/api/v1/jobs/status/$JOB_ID
+        
+        # Load test
+        locust -f tests/performance/locustfile.py --headless -u 20 -r 5 -t 120s --host=http://$ALB_ENDPOINT
+    
+    - name: Database migration tests
+      run: |
+        # Test database migrations
+        kubectl exec -n data-collection-test deployment/data-collection-service -- python manage.py migrate --check
+    
+    - name: API Gateway integration test
+      run: |
+        # Test API Gateway endpoints
+        API_GATEWAY_URL=$(aws apigateway get-rest-apis --query 'items[?name==`data-collection-test-api`].id' --output text)
+        curl -f https://$API_GATEWAY_URL.execute-api.${{ env.AWS_REGION }}.amazonaws.com/test/health
+    
+    - name: WAF and rate limiting tests
+      run: |
+        # Test rate limiting
+        for i in {1..100}; do
+          curl -s -o /dev/null -w "%{http_code}\n" http://test-api.datacollection.com/health
+        done | grep -c "429" || echo "Rate limiting test completed"
+    
+    - name: Monitoring and alerting validation
+      run: |
+        # Verify Prometheus metrics
+        kubectl port-forward -n monitoring svc/prometheus 9090:9090 &
+        sleep 10
+        curl -s http://localhost:9090/api/v1/query?query=up{job="data-collection-service"} | jq '.data.result[0].value[1]'
+    
+    - name: Notify test deployment success
+      run: |
+        curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+          -H 'Content-type: application/json' \
+          --data '{
+            "text": "✅ Test environment deployment completed successfully!",
+            "attachments": [
+              {
+                "color": "good",
+                "fields": [
+                  {
+                    "title": "Environment",
+                    "value": "Test",
+                    "short": true
+                  },
+                  {
+                    "title": "Commit",
+                    "value": "${{ github.sha }}",
+                    "short": true
+                  },
+                  {
+                    "title": "Tests",
+                    "value": "Integration, E2E, Performance, Security",
+                    "short": false
+                  }
+                ]
+              }
+            ]
+          }'
+      if: success()
+    
+    - name: Notify test deployment failure
+      run: |
+        curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+          -H 'Content-type: application/json' \
+          --data '{
+            "text": "❌ Test environment deployment failed!",
+            "attachments": [
+              {
+                "color": "danger",
+                "fields": [
+                  {
+                    "title": "Environment",
+                    "value": "Test",
+                    "short": true
+                  },
+                  {
+                    "title": "Commit",
+                    "value": "${{ github.sha }}",
+                    "short": true
+                  }
+                ]
+              }
+            ]
+          }'
+      if: failure()

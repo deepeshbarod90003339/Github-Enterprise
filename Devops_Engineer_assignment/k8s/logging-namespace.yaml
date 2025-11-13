@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: logging
+  labels:
+    name: logging
+    istio-injection: disabled
+---
+# Storage Class for ELK Stack
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: elk-storage
+provisioner: kubernetes.io/aws-ebs
+parameters:
+  type: gp3
+  fsType: ext4
+  encrypted: "true"
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer

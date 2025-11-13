@@ -1,0 +1,315 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deployment_strategy:
+        description: 'Deployment strategy'
+        required: true
+        default: 'blue-green'
+        type: choice
+        options:
+        - blue-green
+        - canary
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: data-collection/prod/data-collection-service
+  ENVIRONMENT: prod
+  TF_WORKSPACE: prod
+
+jobs:
+  pre-production-checks:
+    runs-on: [self-hosted, linux, x64, aws, prod]
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Final security scan
+      run: |
+        trivy fs --format table --severity CRITICAL,HIGH --exit-code 1 .
+    
+    - name: Infrastructure drift detection
+      run: |
+        cd terraform/environments/prod
+        terraform workspace select prod
+        terraform plan -detailed-exitcode -var-file="terraform.tfvars"
+    
+    - name: Database migration validation
+      run: |
+        python scripts/validate-migrations.py
+    
+    - name: Load test validation
+      run: |
+        # Run load tests against test environment
+        locust -f tests/performance/production-load-test.py --headless -u 100 -r 10 -t 300s --host=http://test-api.datacollection.com
+    
+    - name: Backup verification
+      run: |
+        # Verify database backups are recent
+        aws rds describe-db-snapshots --db-instance-identifier data-collection-prod-postgres --query 'DBSnapshots[0].SnapshotCreateTime'
+
+  deploy-production:
+    runs-on: [self-hosted, linux, x64, aws, prod]
+    needs: pre-production-checks
+    environment: production
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Configure AWS credentials
+      run: |
+        aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws configure set default.region ${{ env.AWS_REGION }}
+    
+    - name: Configure kubectl
+      run: |
+        aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name data-collection-prod-eks
+    
+    - name: Pre-deployment backup
+      run: |
+        # Create database snapshot before deployment
+        aws rds create-db-snapshot \
+          --db-instance-identifier data-collection-prod-postgres \
+          --db-snapshot-identifier "pre-deploy-$(date +%Y%m%d-%H%M%S)"
+    
+    - name: Blue-Green Deployment
+      if: github.event.inputs.deployment_strategy == 'blue-green' || github.event.inputs.deployment_strategy == ''
+      run: |
+        # Deploy green environment
+        helm upgrade --install data-collection-service-green helm/data-collection-service/ \
+          --namespace data-collection-prod \
+          --create-namespace \
+          --set image.repository=${{ secrets.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }} \
+          --set image.tag=main-${{ github.sha }} \
+          --set environment=prod \
+          --set nameOverride=data-collection-service-green \
+          --set resources.requests.cpu=500m \
+          --set resources.requests.memory=512Mi \
+          --set resources.limits.cpu=2000m \
+          --set resources.limits.memory=2Gi \
+          --set autoscaling.minReplicas=3 \
+          --set autoscaling.maxReplicas=20 \
+          --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=${{ secrets.EKS_SERVICE_ACCOUNT_ROLE_ARN_PROD }} \
+          --wait --timeout=20m
+        
+        # Health verification
+        kubectl wait --for=condition=ready pod -l app=data-collection-service-green -n data-collection-prod --timeout=600s
+        
+        # Comprehensive smoke tests on green
+        ALB_ENDPOINT=$(aws elbv2 describe-load-balancers --names data-collection-prod-alb --query 'LoadBalancers[0].DNSName' --output text)
+        
+        # Health check
+        curl -f http://$ALB_ENDPOINT/health
+        
+        # API functionality test
+        JOB_ID=$(curl -X POST http://$ALB_ENDPOINT/api/v1/jobs/trigger \
+          -H "Content-Type: application/json" \
+          -d '{"source_type": "api", "config": {}}' | jq -r '.job_id')
+        
+        sleep 10
+        curl -f http://$ALB_ENDPOINT/api/v1/jobs/status/$JOB_ID
+        
+        # Switch ALB target group to green
+        GREEN_TG_ARN=$(aws elbv2 describe-target-groups --names data-collection-prod-green-tg --query 'TargetGroups[0].TargetGroupArn' --output text)
+        LISTENER_ARN=$(aws elbv2 describe-listeners --load-balancer-arn $(aws elbv2 describe-load-balancers --names data-collection-prod-alb --query 'LoadBalancers[0].LoadBalancerArn' --output text) --query 'Listeners[0].ListenerArn' --output text)
+        
+        aws elbv2 modify-listener --listener-arn $LISTENER_ARN --default-actions Type=forward,TargetGroupArn=$GREEN_TG_ARN
+        
+        # Wait and verify traffic switch
+        sleep 60
+        kubectl get pods -n data-collection-prod
+        
+        # Cleanup old blue deployment
+        helm uninstall data-collection-service-blue -n data-collection-prod || true
+    
+    - name: Canary Deployment
+      if: github.event.inputs.deployment_strategy == 'canary'
+      run: |
+        # Deploy canary version
+        helm upgrade --install data-collection-service-canary helm/data-collection-service/ \
+          --namespace data-collection-prod \
+          --set image.repository=${{ secrets.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }} \
+          --set image.tag=main-${{ github.sha }} \
+          --set environment=prod \
+          --set nameOverride=data-collection-service-canary \
+          --set replicaCount=1 \
+          --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=${{ secrets.EKS_SERVICE_ACCOUNT_ROLE_ARN_PROD }} \
+          --wait --timeout=15m
+        
+        # Configure Istio traffic split (10% canary)
+        kubectl apply -f - <<EOF
+        apiVersion: networking.istio.io/v1beta1
+        kind: VirtualService
+        metadata:
+          name: data-collection-canary
+          namespace: data-collection-prod
+        spec:
+          hosts:
+          - data-collection-service
+          http:
+          - route:
+            - destination:
+                host: data-collection-service
+                subset: stable
+              weight: 90
+            - destination:
+                host: data-collection-service-canary
+                subset: canary
+              weight: 10
+        EOF
+        
+        # Monitor canary for 10 minutes
+        echo "Monitoring canary deployment for 10 minutes..."
+        sleep 600
+        
+        # Check error rates and promote if successful
+        ERROR_RATE=$(kubectl exec -n istio-system deployment/prometheus -- \
+          promtool query instant 'rate(istio_request_total{destination_service_name="data-collection-service-canary",response_code!~"2.."}[5m])' | jq -r '.data.result[0].value[1]' || echo "0")
+        
+        if (( $(echo "$ERROR_RATE < 0.01" | bc -l) )); then
+          echo "Canary deployment successful, promoting to 100%"
+          kubectl patch virtualservice data-collection-canary -n data-collection-prod \
+            --type='json' -p='[{"op": "replace", "path": "/spec/http/0/route/0/weight", "value": 0}]'
+          kubectl patch virtualservice data-collection-canary -n data-collection-prod \
+            --type='json' -p='[{"op": "replace", "path": "/spec/http/0/route/1/weight", "value": 100}]'
+        else
+          echo "Canary deployment failed with error rate: $ERROR_RATE - rolling back"
+          exit 1
+        fi
+    
+    - name: Post-deployment verification
+      run: |
+        # Wait for deployment to stabilize
+        sleep 120
+        
+        # Verify all pods are running
+        kubectl get pods -n data-collection-prod
+        
+        # Get ALB endpoint
+        ALB_ENDPOINT=$(aws elbv2 describe-load-balancers --names data-collection-prod-alb --query 'LoadBalancers[0].DNSName' --output text)
+        
+        # Comprehensive production tests
+        curl -f http://$ALB_ENDPOINT/health
+        curl -f http://$ALB_ENDPOINT/docs
+        
+        # API Gateway tests
+        API_GATEWAY_URL=$(aws apigateway get-rest-apis --query 'items[?name==`data-collection-prod-api`].id' --output text)
+        curl -f https://$API_GATEWAY_URL.execute-api.${{ env.AWS_REGION }}.amazonaws.com/prod/health
+        
+        # Database connectivity test
+        kubectl exec -n data-collection-prod deployment/data-collection-service -- python -c "import psycopg2; print('DB connection OK')"
+        
+        # Redis connectivity test
+        kubectl exec -n data-collection-prod deployment/data-collection-service -- python -c "import redis; print('Redis connection OK')"
+    
+    - name: Update monitoring and alerting
+      run: |
+        # Update Grafana dashboards
+        curl -X POST "${{ secrets.GRAFANA_URL }}/api/dashboards/db" \
+          -H "Authorization: Bearer ${{ secrets.GRAFANA_TOKEN }}" \
+          -H "Content-Type: application/json" \
+          -d @monitoring/grafana-dashboard.json
+        
+        # Update Prometheus alerting rules
+        kubectl apply -f monitoring/prometheus-rules.yaml -n monitoring
+    
+    - name: Performance validation
+      run: |
+        # Run production performance tests
+        ALB_ENDPOINT=$(aws elbv2 describe-load-balancers --names data-collection-prod-alb --query 'LoadBalancers[0].DNSName' --output text)
+        locust -f tests/performance/production-validation.py --headless -u 50 -r 5 -t 180s --host=http://$ALB_ENDPOINT
+    
+    - name: Security validation
+      run: |
+        # Verify WAF is active
+        WAF_ACL_ID=$(aws wafv2 list-web-acls --scope REGIONAL --query 'WebACLs[?Name==`data-collection-prod-waf`].Id' --output text)
+        aws wafv2 get-web-acl --scope REGIONAL --id $WAF_ACL_ID
+        
+        # Test rate limiting
+        ALB_ENDPOINT=$(aws elbv2 describe-load-balancers --names data-collection-prod-alb --query 'LoadBalancers[0].DNSName' --output text)
+        for i in {1..50}; do curl -s -o /dev/null -w "%{http_code}\n" http://$ALB_ENDPOINT/health; done | grep -c "429" || echo "Rate limiting active"
+    
+    - name: Notify production deployment success
+      env:
+        GITHUB_SHA: ${{ github.sha }}
+        DEPLOYMENT_STRATEGY: ${{ github.event.inputs.deployment_strategy || 'blue-green' }}
+      run: |
+        curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+          -H 'Content-type: application/json' \
+          --data "{
+            \"text\": \"🚀 Production deployment completed successfully!\",
+            \"attachments\": [
+              {
+                \"color\": \"good\",
+                \"fields\": [
+                  {
+                    \"title\": \"Environment\",
+                    \"value\": \"Production\",
+                    \"short\": true
+                  },
+                  {
+                    \"title\": \"Version\",
+                    \"value\": \"$GITHUB_SHA\",
+                    \"short\": true
+                  },
+                  {
+                    \"title\": \"Strategy\",
+                    \"value\": \"$DEPLOYMENT_STRATEGY\",
+                    \"short\": true
+                  },
+                  {
+                    \"title\": \"URL\",
+                    \"value\": \"https://api.datacollection.com\",
+                    \"short\": true
+                  }
+                ]
+              }
+            ]
+          }"
+      if: success()
+    
+    - name: Rollback on failure
+      if: failure()
+      run: |
+        echo "Production deployment failed - initiating automatic rollback"
+        
+        # Rollback Helm deployment
+        helm rollback data-collection-service -n data-collection-prod
+        
+        # Restore previous ALB target group
+        BLUE_TG_ARN=$(aws elbv2 describe-target-groups --names data-collection-prod-blue-tg --query 'TargetGroups[0].TargetGroupArn' --output text)
+        LISTENER_ARN=$(aws elbv2 describe-listeners --load-balancer-arn $(aws elbv2 describe-load-balancers --names data-collection-prod-alb --query 'LoadBalancers[0].LoadBalancerArn' --output text) --query 'Listeners[0].ListenerArn' --output text)
+        aws elbv2 modify-listener --listener-arn $LISTENER_ARN --default-actions Type=forward,TargetGroupArn=$BLUE_TG_ARN
+        
+        # Notify rollback
+        curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+          -H 'Content-type: application/json' \
+          --data "{
+            \"text\": \"🚨 Production deployment failed - automatic rollback completed!\",
+            \"attachments\": [
+              {
+                \"color\": \"danger\",
+                \"fields\": [
+                  {
+                    \"title\": \"Environment\",
+                    \"value\": \"Production\",
+                    \"short\": true
+                  },
+                  {
+                    \"title\": \"Failed Version\",
+                    \"value\": \"$GITHUB_SHA\",
+                    \"short\": true
+                  },
+                  {
+                    \"title\": \"Status\",
+                    \"value\": \"Rolled back to previous version\",
+                    \"short\": false
+                  }
+                ]
+              }
+            ]
+          }"

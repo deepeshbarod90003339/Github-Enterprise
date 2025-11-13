@@ -1,0 +1,264 @@
+name: Deploy to Development
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: data-collection/dev/data-collection-service
+  ENVIRONMENT: dev
+  TF_WORKSPACE: dev
+
+jobs:
+  code-quality:
+    runs-on: [self-hosted, linux, x64, aws, dev]
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install flake8 pytest pytest-cov black isort bandit safety
+        pip install -r app/requirements.txt
+    
+    - name: SonarQube Scan
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      run: |
+        sonar-scanner \
+          -Dsonar.projectKey=data-collection-service-dev \
+          -Dsonar.sources=app/ \
+          -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }} \
+          -Dsonar.login=${{ secrets.SONAR_TOKEN }} \
+          -Dsonar.python.coverage.reportPaths=coverage.xml
+    
+    - name: Code formatting check
+      run: black --check app/
+    
+    - name: Import sorting check
+      run: isort --check-only app/
+    
+    - name: Linting
+      run: flake8 app/ --max-line-length=127 --exclude=tests/
+    
+    - name: Security scan with Bandit
+      run: bandit -r app/ -f json -o bandit-report.json -x app/tests/
+    
+    - name: OWASP Dependency Check
+      run: |
+        dependency-check --project "data-collection-service" --scan app/ --format ALL --out reports/
+    
+    - name: Upload security reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-reports-dev
+        path: |
+          bandit-report.json
+          reports/
+
+  unit-tests:
+    runs-on: [self-hosted, linux, x64, aws, dev]
+    needs: code-quality
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        pip install -r app/requirements.txt
+        pip install pytest pytest-cov
+    
+    - name: Run unit tests
+      run: |
+        pytest app/tests/ --cov=app --cov-report=xml --cov-report=html --junitxml=test-results.xml
+    
+    - name: Upload test results
+      uses: actions/upload-artifact@v3
+      with:
+        name: test-results-dev
+        path: |
+          coverage.xml
+          htmlcov/
+          test-results.xml
+
+  build-and-push:
+    runs-on: [self-hosted, linux, x64, aws, dev]
+    needs: [code-quality, unit-tests]
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Configure AWS credentials
+      run: |
+        aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws configure set default.region ${{ env.AWS_REGION }}
+    
+    - name: Login to Amazon ECR
+      run: |
+        aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.ECR_REGISTRY }}
+    
+    - name: Build Docker image
+      run: |
+        docker build -t ${{ secrets.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:develop-${{ github.sha }} .
+        docker build -t ${{ secrets.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest .
+    
+    - name: Container security scan
+      run: |
+        trivy image --format sarif --output trivy-results.sarif ${{ secrets.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:develop-${{ github.sha }}
+    
+    - name: Push Docker image
+      run: |
+        docker push ${{ secrets.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:develop-${{ github.sha }}
+        docker push ${{ secrets.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+
+  k8s-validation:
+    runs-on: [self-hosted, linux, x64, aws, dev]
+    needs: build-and-push
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Validate Kubernetes manifests
+      run: |
+        kubeval k8s/*.yaml
+    
+    - name: Helm lint and validate
+      run: |
+        helm lint helm/data-collection-service/
+        helm template data-collection-service helm/data-collection-service/ \
+          --set image.repository=${{ secrets.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }} \
+          --set image.tag=develop-${{ github.sha }} \
+          --set environment=dev \
+          --validate
+
+  deploy-dev:
+    runs-on: [self-hosted, linux, x64, aws, dev]
+    needs: [build-and-push, k8s-validation]
+    environment: development
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Configure kubectl
+      run: |
+        aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name data-collection-dev-eks
+    
+    - name: Deploy to development
+      run: |
+        helm upgrade --install data-collection-service helm/data-collection-service/ \
+          --namespace data-collection-dev \
+          --create-namespace \
+          --set image.repository=${{ secrets.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }} \
+          --set image.tag=develop-${{ github.sha }} \
+          --set environment=dev \
+          --set resources.requests.cpu=100m \
+          --set resources.requests.memory=128Mi \
+          --set resources.limits.cpu=500m \
+          --set resources.limits.memory=512Mi \
+          --set autoscaling.minReplicas=1 \
+          --set autoscaling.maxReplicas=3 \
+          --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"=${{ secrets.EKS_SERVICE_ACCOUNT_ROLE_ARN_DEV }} \
+          --wait --timeout=10m
+    
+    - name: Verify deployment
+      run: |
+        kubectl wait --for=condition=ready pod -l app=data-collection-service -n data-collection-dev --timeout=300s
+        kubectl get pods -n data-collection-dev
+        kubectl get svc -n data-collection-dev
+    
+    - name: Run smoke tests
+      run: |
+        # Get ALB endpoint
+        ALB_ENDPOINT=$(aws elbv2 describe-load-balancers --names data-collection-dev-alb --query 'LoadBalancers[0].DNSName' --output text)
+        
+        # Health check
+        curl -f http://$ALB_ENDPOINT/health || exit 1
+        
+        # API documentation check
+        curl -f http://$ALB_ENDPOINT/docs || exit 1
+        
+        # Job creation test
+        JOB_RESPONSE=$(curl -X POST http://$ALB_ENDPOINT/api/v1/jobs/trigger \
+          -H "Content-Type: application/json" \
+          -d '{"source_type": "api", "config": {}}')
+        
+        echo "Job creation response: $JOB_RESPONSE"
+    
+    - name: Update API Gateway
+      run: |
+        # Update API Gateway target to point to new ALB
+        ALB_ENDPOINT=$(aws elbv2 describe-load-balancers --names data-collection-dev-alb --query 'LoadBalancers[0].DNSName' --output text)
+        
+        # This would typically involve updating the API Gateway integration
+        echo "ALB Endpoint: $ALB_ENDPOINT"
+    
+    - name: Notify deployment status
+      run: |
+        curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+          -H 'Content-type: application/json' \
+          --data '{
+            "text": "🚀 Development deployment completed successfully!",
+            "attachments": [
+              {
+                "color": "good",
+                "fields": [
+                  {
+                    "title": "Environment",
+                    "value": "Development",
+                    "short": true
+                  },
+                  {
+                    "title": "Commit",
+                    "value": "${{ github.sha }}",
+                    "short": true
+                  },
+                  {
+                    "title": "Branch",
+                    "value": "${{ github.ref_name }}",
+                    "short": true
+                  }
+                ]
+              }
+            ]
+          }'
+      if: success()
+    
+    - name: Notify deployment failure
+      run: |
+        curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+          -H 'Content-type: application/json' \
+          --data '{
+            "text": "❌ Development deployment failed!",
+            "attachments": [
+              {
+                "color": "danger",
+                "fields": [
+                  {
+                    "title": "Environment",
+                    "value": "Development",
+                    "short": true
+                  },
+                  {
+                    "title": "Commit",
+                    "value": "${{ github.sha }}",
+                    "short": true
+                  }
+                ]
+              }
+            ]
+          }'
+      if: failure()

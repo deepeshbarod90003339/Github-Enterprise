@@ -1,0 +1,131 @@
+# Application-specific Filebeat configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-filebeat-config
+  namespace: data-collection
+data:
+  filebeat.yml: |
+    filebeat.inputs:
+    - type: log
+      paths:
+        - /var/log/*.log
+        - /var/log/app/*.log
+      fields:
+        service: data-collection-service
+        environment: ${ENVIRONMENT}
+        pod_name: ${POD_NAME}
+        namespace: ${NAMESPACE}
+        node_name: ${NODE_NAME}
+      fields_under_root: true
+      multiline.pattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
+      multiline.negate: true
+      multiline.match: after
+      processors:
+        - add_kubernetes_metadata:
+            host: ${NODE_NAME}
+        - add_docker_metadata: ~
+        - add_host_metadata: ~
+    
+    output.logstash:
+      hosts: ["logstash.logging.svc.cluster.local:5044"]
+    
+    logging.level: info
+    logging.to_files: false
+---
+# Enhanced Logstash configuration for application logs
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: enhanced-logstash-config
+  namespace: logging
+data:
+  logstash.conf: |
+    input {
+      beats {
+        port => 5044
+      }
+    }
+    
+    filter {
+      # Parse application logs
+      if [service] == "data-collection-service" {
+        grok {
+          match => { 
+            "message" => "%{TIMESTAMP_ISO8601:log_timestamp} - %{WORD:logger_name} - %{LOGLEVEL:log_level} - %{GREEDYDATA:log_message}" 
+          }
+        }
+        
+        date {
+          match => [ "log_timestamp", "yyyy-MM-dd HH:mm:ss,SSS" ]
+        }
+        
+        # Parse JSON logs if present
+        if [log_message] =~ /^\{.*\}$/ {
+          json {
+            source => "log_message"
+            target => "parsed_json"
+          }
+        }
+        
+        # Extract request ID for tracing
+        if [log_message] =~ /request_id/ {
+          grok {
+            match => { "log_message" => ".*request_id[=:](?<request_id>[a-zA-Z0-9-]+)" }
+          }
+        }
+        
+        # Add custom fields
+        mutate {
+          add_field => { 
+            "cluster_name" => "data-collection-cluster"
+            "log_source" => "application"
+          }
+        }
+      }
+      
+      # Parse Kubernetes system logs
+      if [kubernetes] {
+        mutate {
+          add_field => { "log_source" => "kubernetes" }
+        }
+      }
+      
+      # Parse Istio logs
+      if [kubernetes][container][name] =~ /istio/ {
+        mutate {
+          add_field => { "log_source" => "istio" }
+        }
+      }
+    }
+    
+    output {
+      elasticsearch {
+        hosts => ["elasticsearch-client.logging.svc.cluster.local:9200"]
+        index => "%{[service]:-kubernetes}-logs-%{+YYYY.MM.dd}"
+        template_name => "data-collection-template"
+        template_pattern => "*-logs-*"
+        template => {
+          "index_patterns" => ["*-logs-*"],
+          "settings" => {
+            "number_of_shards" => 1,
+            "number_of_replicas" => 1,
+            "index.lifecycle.name" => "data-collection-logs-policy",
+            "index.lifecycle.rollover_alias" => "data-collection-logs"
+          },
+          "mappings" => {
+            "properties" => {
+              "@timestamp" => { "type" => "date" },
+              "log_level" => { "type" => "keyword" },
+              "service" => { "type" => "keyword" },
+              "environment" => { "type" => "keyword" },
+              "request_id" => { "type" => "keyword" },
+              "log_message" => { "type" => "text" }
+            }
+          }
+        }
+      }
+      
+      # Debug output (optional)
+      # stdout { codec => rubydebug }
+    }
